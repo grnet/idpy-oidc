@@ -707,7 +707,7 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
                     try:
                         verified_payload = wia_jws.verify_compact(_wia_raw, keys=[key])
                         logger.info(
-                            f"WIA signature verified with trusted attester (cert {idx}): {_iss}"
+                            f"WIA signature verified with trusted attester (cert {idx}): {_wia.get('iss')}"
                         )
                         signature_verified = True
                         break
