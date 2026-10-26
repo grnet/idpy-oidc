@@ -241,6 +241,11 @@ class Endpoint(Node):
                 "status_validator_url"
             ]
 
+        # GRNET fork: the wallet providers list, see ClientAuthenticationAttestation.
+        for key in ("wallet_providers_lote_url", "lote_signer_ca_path"):
+            if key in conf["endpoint"]["token"]["kwargs"]:
+                kwargs[key] = conf["endpoint"]["token"]["kwargs"][key]
+
         if http_info is None:
             http_info = {}
 
