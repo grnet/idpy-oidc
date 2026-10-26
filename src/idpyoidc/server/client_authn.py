@@ -22,6 +22,7 @@ from idpyoidc.message.oauth2.device_authorization import WalletInstanceAttestati
 from idpyoidc.message.oidc import JsonWebToken, verified_claim_name
 from idpyoidc.node import topmost_unit
 from idpyoidc.server.constant import JWT_BEARER
+from idpyoidc.server.lote import LoteError, chain_is_trusted, lote_trust_anchors
 from idpyoidc.server.exception import (
     BearerTokenAuthenticationError,
     ClientAuthenticationError,
@@ -112,6 +113,26 @@ def basic_authn(authorization_token: str):
         raise ValueError("Illegal token")
 
     return dict(zip(["id", "secret"], part))
+
+
+def _x5c_certificates(jws_headers: dict) -> list:
+    """The certificates of a JWS header's x5c, leaf first."""
+    x5c = jws_headers.get("x5c")
+    if not x5c:
+        raise ClientAuthenticationError("WIA header has no x5c")
+    return [x509.load_der_x509_certificate(base64.b64decode(c)) for c in x5c]
+
+
+def _verify_jws_with_certificate(jws_raw: str, cert) -> None:
+    """Verify a compact JWS with a certificate's public key; raises if it fails."""
+    public_key = cert.public_key()
+    if isinstance(public_key, ec.EllipticCurvePublicKey):
+        key = ECKey(pub_key=public_key)
+    elif isinstance(public_key, rsa.RSAPublicKey):
+        key = RSAKey(pub_key=public_key)
+    else:
+        raise ValueError(f"Unsupported key type {type(public_key).__name__}")
+    factory(jws_raw).verify_compact(jws_raw, keys=[key])
 
 
 class NoneAuthn(ClientAuthnMethod):
@@ -603,6 +624,7 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
         trusted_attesters=None,
         trust_validator_url=None,
         status_validator_url=None,
+        lote_anchors=None,
     ):
         _now = time.time()
 
@@ -623,97 +645,52 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
 
         if trust_validator_url:
             try:
-                signature_verified = self.call_trust_validator(
+                trusted = self.call_trust_validator(
                     url=trust_validator_url,
                     chain=_wia_headers["x5c"],
-                    verification_context="WalletInstanceAttestation",
+                    verification_context="WalletProviderAttestation",
                 )
             except Exception as e:
                 logger.error(f"Error calling trust validator: {e}")
                 raise ClientAuthenticationError(f"Error calling trust validator: {e}")
+            # GRNET fork: the validator only says whether the chain is trusted;
+            # the attestation must still be signed by the chain's leaf.
+            if trusted:
+                try:
+                    _verify_jws_with_certificate(_wia_raw, _x5c_certificates(_wia_headers)[0])
+                    signature_verified = True
+                except Exception as e:
+                    verification_errors.append(f"x5c leaf: {type(e).__name__}: {e}")
+            else:
+                verification_errors.append("trust validator: chain not trusted")
+
+        elif lote_anchors is not None:
+            # GRNET fork: the x5c chain must lead to a certificate on the wallet
+            # providers list, and its leaf must have signed the attestation.
+            try:
+                chain = _x5c_certificates(_wia_headers)
+                if not chain_is_trusted(chain, lote_anchors):
+                    raise ClientAuthenticationError(
+                        "x5c does not chain to the wallet providers list"
+                    )
+                _verify_jws_with_certificate(_wia_raw, chain[0])
+                logger.info(
+                    f"WIA signature verified, chain trusted by the wallet providers list: {_wia.get('iss')}"
+                )
+                signature_verified = True
+            except Exception as e:
+                verification_errors.append(f"wallet providers list: {type(e).__name__}: {e}")
 
         else:
             for idx, attester_cert_pem in enumerate(trusted_attesters):
                 try:
-                    # Load the certificate
                     cert = x509.load_pem_x509_certificate(attester_cert_pem.encode())
-                    public_key = cert.public_key()
-
-                    # Convert to JWK format for verification
-                    if isinstance(public_key, ec.EllipticCurvePublicKey):
-                        numbers = public_key.public_numbers()
-                        curve_name = public_key.curve.name
-
-                        # Map curve names to JWK crv values
-                        curve_map = {
-                            "secp256r1": "P-256",
-                            "secp384r1": "P-384",
-                            "secp521r1": "P-521",
-                        }
-
-                        crv = curve_map.get(curve_name)
-                        if not crv:
-                            logger.debug(
-                                f"Attester cert {idx}: Unsupported curve {curve_name}"
-                            )
-                            continue
-
-                        # Get coordinate byte lengths
-                        coord_byte_length = {
-                            "P-256": 32,
-                            "P-384": 48,
-                            "P-521": 66,
-                        }[crv]
-
-                        x_bytes = numbers.x.to_bytes(coord_byte_length, "big")
-                        y_bytes = numbers.y.to_bytes(coord_byte_length, "big")
-
-                        jwk_dict = {
-                            "kty": "EC",
-                            "crv": crv,
-                            "x": base64.urlsafe_b64encode(x_bytes).decode().rstrip("="),
-                            "y": base64.urlsafe_b64encode(y_bytes).decode().rstrip("="),
-                        }
-
-                    elif isinstance(public_key, rsa.RSAPublicKey):
-                        numbers = public_key.public_numbers()
-
-                        n_bytes = numbers.n.to_bytes(
-                            (numbers.n.bit_length() + 7) // 8, "big"
-                        )
-                        e_bytes = numbers.e.to_bytes(
-                            (numbers.e.bit_length() + 7) // 8, "big"
-                        )
-
-                        jwk_dict = {
-                            "kty": "RSA",
-                            "n": base64.urlsafe_b64encode(n_bytes).decode().rstrip("="),
-                            "e": base64.urlsafe_b64encode(e_bytes).decode().rstrip("="),
-                        }
-                    else:
-                        logger.debug(
-                            f"Attester cert {idx}: Unsupported key type {type(public_key)}"
-                        )
-                        continue
-
-                    # Create key and verify
-                    if jwk_dict["kty"] == "EC":
-                        key = ECKey(**jwk_dict)
-                    else:
-                        key = RSAKey(**jwk_dict)
-
-                    wia_jws = factory(_wia_raw)
-
-                    try:
-                        verified_payload = wia_jws.verify_compact(_wia_raw, keys=[key])
-                        logger.info(
-                            f"WIA signature verified with trusted attester (cert {idx}): {_wia.get('iss')}"
-                        )
-                        signature_verified = True
-                        break
-                    except Exception as verify_error:
-                        raise verify_error
-
+                    _verify_jws_with_certificate(_wia_raw, cert)
+                    logger.info(
+                        f"WIA signature verified with trusted attester (cert {idx}): {_wia.get('iss')}"
+                    )
+                    signature_verified = True
+                    break
                 except Exception as e:
                     # Try next certificate
                     error_msg = f"Attester cert {idx}: {type(e).__name__}: {str(e)}"
@@ -944,9 +921,27 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
         status_validator_url = kwargs.get("status_validator_url")
 
         trusted_attesters = None
+        lote_anchors = None
+
+        # GRNET fork: a wallet providers LoTE instead of pinned certificates.
+        wallet_providers_lote_url = kwargs.get("wallet_providers_lote_url")
 
         if trust_validator_url:
             logger.info(f"Using trust validator URL: {trust_validator_url}")
+
+        elif wallet_providers_lote_url:
+            try:
+                lote_anchors = lote_trust_anchors(
+                    wallet_providers_lote_url,
+                    signer_ca_path=kwargs.get("lote_signer_ca_path"),
+                ).anchors()
+            except LoteError as e:
+                logger.error(str(e))
+                raise ClientAuthenticationError("Wallet providers list unavailable")
+            logger.info(
+                f"Using wallet providers list {wallet_providers_lote_url}: "
+                f"{len(lote_anchors)} trust anchor(s)"
+            )
 
         else:
             trusted_attesters_path = kwargs.get("trusted_attesters_path")
@@ -1009,6 +1004,7 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
             trusted_attesters=trusted_attesters,
             trust_validator_url=trust_validator_url,
             status_validator_url=status_validator_url,
+            lote_anchors=lote_anchors,
         )
 
         self.verify_pop(
