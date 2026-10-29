@@ -91,6 +91,16 @@ def test_attestation_signature(pki):
         _verify_jws_with_certificate(token, pki["other"])
 
 
+def test_attestation_signature_with_kid(pki):
+    # Most wallets put a kid in the attestation header; the key built from the
+    # certificate has none, and must still match.
+    key = ECKey(priv_key=pki["leaf_key"], kid="DuVIGCpOg8UeaMf8SjJOedzjcZJ2AD0bJitilM3Yge4")
+    token = JWS(json.dumps({"sub": "w"}), alg="ES256").sign_compact([key])
+    _verify_jws_with_certificate(token, pki["leaf"])
+    with pytest.raises(Exception):
+        _verify_jws_with_certificate(token, pki["other"])
+
+
 def _lote(entries, signer_key, signer_cert, next_update=None):
     payload = {
         "LoTE": {

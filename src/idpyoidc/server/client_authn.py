@@ -125,14 +125,20 @@ def _x5c_certificates(jws_headers: dict) -> list:
 
 def _verify_jws_with_certificate(jws_raw: str, cert) -> None:
     """Verify a compact JWS with a certificate's public key; raises if it fails."""
+    _jws = factory(jws_raw)
+    # A key built from a certificate has no kid, and cryptojwt drops any key whose
+    # kid isn't the header's, so most wallets' attestations failed with
+    # NoSuitableSigningKeys. The certificate decides which key, so take the
+    # header's kid.
+    kid = _jws.jwt.headers.get("kid", "")
     public_key = cert.public_key()
     if isinstance(public_key, ec.EllipticCurvePublicKey):
-        key = ECKey(pub_key=public_key)
+        key = ECKey(pub_key=public_key, kid=kid)
     elif isinstance(public_key, rsa.RSAPublicKey):
-        key = RSAKey(pub_key=public_key)
+        key = RSAKey(pub_key=public_key, kid=kid)
     else:
         raise ValueError(f"Unsupported key type {type(public_key).__name__}")
-    factory(jws_raw).verify_compact(jws_raw, keys=[key])
+    _jws.verify_compact(jws_raw, keys=[key])
 
 
 class NoneAuthn(ClientAuthnMethod):
