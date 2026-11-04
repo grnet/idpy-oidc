@@ -9,6 +9,7 @@ from typing import Callable, Dict, Optional, Union
 
 import requests
 from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptojwt.exception import BadSignature, Invalid, IssuerNotFound, MissingKey
 from cryptojwt.jwk.ec import ECKey
@@ -32,6 +33,7 @@ from idpyoidc.server.exception import (
     ToOld,
     UnknownClient,
 )
+from idpyoidc.server.lote import LoteError, lote_trust_anchors
 from idpyoidc.server.util import current_issuer, endpoint_url
 from idpyoidc.util import importer, sanitize
 
@@ -448,6 +450,11 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
     certificate and that chain is trusted: by the trust validator
     (``trust_validator_url``), or else by the certificates in
     ``trusted_attesters_path``.
+
+    GRNET fork: or else by the certificates of a wallet providers list
+    (``wallet_providers_lote_url``), an ETSI TS 119 602 LoTE such as the
+    European Commission's, whose signer must chain to the CAs in
+    ``lote_signer_ca_path``. See :mod:`idpyoidc.server.lote`.
     """
 
     tag = "attest_jwt_client_auth"
@@ -829,6 +836,18 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
             raise ClientAuthenticationError("No trusted attester certificates found")
         return trusted_attesters
 
+    @staticmethod
+    def _load_lote_attesters(wallet_providers_lote_url, lote_signer_ca_path=None) -> list:
+        """GRNET fork: the wallet providers list's certificates, as trusted attesters."""
+        try:
+            anchors = lote_trust_anchors(wallet_providers_lote_url, signer_ca_path=lote_signer_ca_path).anchors()
+        except LoteError as err:
+            logger.error(str(err))
+            raise ClientAuthenticationError("Wallet providers list unavailable")
+        if not anchors:
+            raise ClientAuthenticationError("The wallet providers list has no trusted attesters")
+        return [a.public_bytes(serialization.Encoding.PEM).decode() for a in anchors]
+
     def _audiences(self, endpoint, pop_allowed_aud=None) -> list:
         """What the PoP 'aud' may be: the issuer identifier the request is answered as
         (see :data:`idpyoidc.server.util.CURRENT_ISSUER`), the endpoint URL under it,
@@ -867,7 +886,12 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
         trust_validator_url = kwargs.get("trust_validator_url")
         trusted_attesters = None
         if not trust_validator_url:
-            trusted_attesters = self._load_trusted_attesters(kwargs.get("trusted_attesters_path"))
+            if kwargs.get("wallet_providers_lote_url"):
+                trusted_attesters = self._load_lote_attesters(
+                    kwargs["wallet_providers_lote_url"], kwargs.get("lote_signer_ca_path")
+                )
+            else:
+                trusted_attesters = self._load_trusted_attesters(kwargs.get("trusted_attesters_path"))
 
         jws = self._parse_jws(wia_raw, "Client Attestation")
         _wia_headers = jws.jwt.headers
