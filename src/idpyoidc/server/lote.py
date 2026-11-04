@@ -63,6 +63,14 @@ def _is_valid_now(cert: x509.Certificate, now: datetime) -> bool:
     return cert.not_valid_before_utc <= now <= cert.not_valid_after_utc
 
 
+def _issued_by(cert: x509.Certificate, issuer: x509.Certificate) -> bool:
+    try:
+        cert.verify_directly_issued_by(issuer)
+    except Exception:
+        return False
+    return True
+
+
 def chain_is_trusted(chain: List[x509.Certificate], anchors: List[x509.Certificate],
                      now: Optional[datetime] = None) -> bool:
     """
@@ -77,22 +85,14 @@ def chain_is_trusted(chain: List[x509.Certificate], anchors: List[x509.Certifica
     for i, cert in enumerate(chain):
         if not _is_valid_now(cert, now):
             return False
-        if i > 0:
-            try:
-                chain[i - 1].verify_directly_issued_by(cert)
-            except Exception:
-                return False
+        if i > 0 and not _issued_by(chain[i - 1], cert):
+            return False
         # The anchor itself is in the chain.
         if cert.public_bytes(serialization.Encoding.DER) in anchor_der:
             return True
         # The anchor issued this certificate.
-        for anchor in anchors:
-            try:
-                cert.verify_directly_issued_by(anchor)
-            except Exception:
-                continue
-            if _is_valid_now(anchor, now):
-                return True
+        if any(_issued_by(cert, anchor) and _is_valid_now(anchor, now) for anchor in anchors):
+            return True
     return False
 
 
