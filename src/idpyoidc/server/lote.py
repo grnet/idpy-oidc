@@ -20,43 +20,43 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptojwt.jwk.ec import ECKey
+from cryptojwt.jwk.rsa import RSAKey
+from cryptojwt.jws.jws import factory
 
 logger = logging.getLogger(__name__)
 
 WALLET_PROVIDER_ISSUANCE = "http://uri.etsi.org/19602/SvcType/WalletSolution/Issuance"
-
-_JWS_HASHES = {"256": hashes.SHA256(), "384": hashes.SHA384(), "512": hashes.SHA512()}
 
 
 class LoteError(Exception):
     pass
 
 
-def _b64url(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
-
-
-def _verify_jws_signature(header: dict, signing_input: bytes, signature: bytes,
-                          cert: x509.Certificate) -> None:
-    alg = header.get("alg", "")
-    digest = _JWS_HASHES.get(alg[2:])
-    key = cert.public_key()
-    if alg.startswith("RS") and digest and isinstance(key, rsa.RSAPublicKey):
-        key.verify(signature, signing_input, padding.PKCS1v15(), digest)
-    elif alg.startswith("PS") and digest and isinstance(key, rsa.RSAPublicKey):
-        key.verify(signature, signing_input,
-                   padding.PSS(mgf=padding.MGF1(digest), salt_length=digest.digest_size),
-                   digest)
-    elif alg.startswith("ES") and digest and isinstance(key, ec.EllipticCurvePublicKey):
-        half = len(signature) // 2
-        der = encode_dss_signature(int.from_bytes(signature[:half], "big"),
-                                   int.from_bytes(signature[half:], "big"))
-        key.verify(der, signing_input, ec.ECDSA(digest))
+def _verify_jws(compact_jws: str) -> Tuple[List[x509.Certificate], dict]:
+    """The signer's chain (x5c) and the payload, once the signature checks out."""
+    jws = factory(compact_jws)
+    if jws is None:
+        raise LoteError("not a compact JWS")
+    header = jws.jwt.headers
+    x5c = [x509.load_der_x509_certificate(base64.b64decode(c)) for c in header.get("x5c", [])]
+    if not x5c:
+        raise LoteError("no x5c in the LoTE's JWS header")
+    public_key = x5c[0].public_key()
+    if isinstance(public_key, rsa.RSAPublicKey):
+        key = RSAKey(pub_key=public_key)
+    elif isinstance(public_key, ec.EllipticCurvePublicKey):
+        key = ECKey(pub_key=public_key)
     else:
-        raise LoteError(f"unsupported LoTE signature: alg {alg}, key {type(key).__name__}")
+        raise LoteError(f"unsupported LoTE signing key: {type(public_key).__name__}")
+    # The key comes from x5c. cryptojwt drops a key whose kid differs from the
+    # header's, and the Commission's lists carry one.
+    key.kid = header.get("kid") or ""
+    payload = jws.verify_compact(compact_jws, keys=[key])
+    # A dict, unless the header has a cty (the Commission's lists say "json").
+    return x5c, json.loads(payload) if isinstance(payload, (str, bytes)) else payload
 
 
 def _is_valid_now(cert: x509.Certificate, now: datetime) -> bool:
@@ -138,21 +138,12 @@ class LoteTrustAnchors:
         return self.parse(response.text.strip())
 
     def parse(self, compact_jws: str) -> List[x509.Certificate]:
-        parts = compact_jws.split(".")
-        if len(parts) != 3:
-            raise LoteError("not a compact JWS")
-        header = json.loads(_b64url(parts[0]))
-        x5c = [x509.load_der_x509_certificate(base64.b64decode(c)) for c in header.get("x5c", [])]
-        if not x5c:
-            raise LoteError("no x5c in the LoTE's JWS header")
-        _verify_jws_signature(header, f"{parts[0]}.{parts[1]}".encode("ascii"),
-                              _b64url(parts[2]), x5c[0])
+        x5c, payload = _verify_jws(compact_jws)
         # The signer must chain to a configured CA (the Commission's root and
         # CommisSign); without one configured only the signature is checked.
         if self.signer_cas and not chain_is_trusted(x5c, self.signer_cas):
             raise LoteError("the LoTE's signer does not chain to the configured CAs")
 
-        payload = json.loads(_b64url(parts[1]))
         lote = payload.get("LoTE", payload)
         next_update = lote.get("ListAndSchemeInformation", {}).get("NextUpdate")
         if next_update:
@@ -161,7 +152,9 @@ class LoteTrustAnchors:
                 raise LoteError(f"the LoTE is past its NextUpdate ({next_update})")
 
         anchors = []
-        # The empty twins used for negative tests have no TrustedEntitiesList.
+        # The Commission publishes an empty copy of each list for negative tests
+        # (wallet-providers_empty.json beside wallet-providers.json). The empty
+        # copies leave TrustedEntitiesList out altogether.
         for entity in lote.get("TrustedEntitiesList") or []:
             for service in entity.get("TrustedEntityServices") or []:
                 info = service.get("ServiceInformation", {})

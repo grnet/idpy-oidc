@@ -241,7 +241,7 @@ def test_list_unavailable(method, wia_pki, monkeypatch):
 
 
 def test_empty_list(method, wia_pki, monkeypatch):
-    # The empty twins of the Commission's lists, used for negative tests.
+    # Like the Commission's empty copies (wallet-providers_empty.json), used for negative tests.
     _use_list(monkeypatch, _FakeList([]))
     with pytest.raises(ClientAuthenticationError):
         authenticate(method, make_wia(wia_pki), make_pop(wia_pki), wallet_providers_lote_url=LIST_URL)
