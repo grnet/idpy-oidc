@@ -234,6 +234,9 @@ class Endpoint(Node):
             "status_validator_url",
             "status_validation_context",
             "pop_allowed_aud",
+            # GRNET fork: the wallet providers list, see ClientAuthenticationAttestation
+            "wallet_providers_lote_url",
+            "lote_signer_ca_path",
         ):
             if _name in _token_kwargs:
                 kwargs[_name] = _token_kwargs[_name]
